@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas_ta as ta
 
 class Utils:
     @staticmethod
@@ -201,7 +202,36 @@ class Utils:
         fig.tight_layout()
         plt.show()
         return fig, ax
+    
+    @staticmethod
+    def add_market_indicators(DF):
+        parts = []
+        for asset in DF.columns.get_level_values(0).unique():
+            h = DF[(asset, "High")]
+            l = DF[(asset, "Low")]
+            c = DF[(asset, "Close")]
 
+            rsi = ta.rsi(c, length=14).rename("RSI")
+
+            tp = (h + l + c) / 3
+            mad = (tp - tp.rolling(14).mean()).abs().rolling(14).mean()
+            cci = ((tp - tp.rolling(14).mean()) / (0.015 * mad)).rename("CCI")
+
+            adx = ta.adx(h, l, c, length=14)          # ADX_14, DMP_14, DMN_14
+            macd = ta.macd(c, fast=12, slow=26, signal=9)  # MACD_*, MACDh_*, MACDs_*
+
+            ind = pd.concat([rsi, cci, adx, macd], axis=1)
+            ind.columns = pd.MultiIndex.from_product(
+                [[asset], ind.columns], names=["Asset", "Metric"]
+            )
+            parts.append(ind)
+
+        return pd.concat([DF] + parts, axis=1).sort_index(axis=1)
+
+    # For LASSO Test
+    @staticmethod
+    def get_y_true(DF):
+        return 
 if __name__ == "__main__":
     DF = Utils.load_data()
     # Utils.validate_data(DF)
