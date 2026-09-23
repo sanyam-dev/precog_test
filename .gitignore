@@ -37,6 +37,7 @@ htmlcov/
 # IDE / OS
 .idea/
 .vscode/
+pyrightconfig.json
 *.swp
 .DS_Store
 Thumbs.db

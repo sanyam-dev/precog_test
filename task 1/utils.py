@@ -114,7 +114,6 @@ class Utils:
     @staticmethod
     def validate_data(DF, tolerance=1e-10):
         assets = DF.columns.get_level_values(0).unique()
-
         assert len(assets) == 100, "Expected 100 assets"
         assert DF.index.is_unique, "Duplicate dates found"
         assert DF.index.is_monotonic_increasing, "Dates are not sorted"
@@ -228,10 +227,17 @@ class Utils:
 
         return pd.concat([DF] + parts, axis=1).sort_index(axis=1)
 
-    # For LASSO Test
+
+
     @staticmethod
-    def get_y_true(DF):
-        return 
+    def get_signals_from_features(features):
+        signals = pd.DataFrame(features)
+        # Rules for different signals: 
+        # For volume 20 sma:
+        
+
+
+
 if __name__ == "__main__":
     DF = Utils.load_data()
     # Utils.validate_data(DF)
