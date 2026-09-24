@@ -219,26 +219,101 @@ class Utils:
 
     @staticmethod
     def get_macd_signal(macd, macds, macdh):
-        """
-        Takes in a dataframe of features for single asset and returns macd.
-        Apply this function with groupby to get the signal for all assets.
+        rising  = macdh > macdh.shift(1) 
+        falling = macdh < macdh.shift(1)
 
+        buy  = (macd > macds) & rising      # above signal, momentum growing
+        sell = (macd < macds) & falling     # below signal, momentum falling
 
-        """
-        macd_signal_crossover_up = ((macd > macds) & (macd.shift(1) <= macds.shift(1))).apply(lambda x: 1 if x else 0)
-        macd_zero_crossover_up = ((macd > 0) & (macd.shift(1) <= 0)).apply(lambda x: 1 if x else 0)
-        macd_signal_crossover_down = ((macd < macds) & (macd.shift(1) >= macds.shift(1))).apply(lambda x: -1 if x else 0)
-        macd_zero_crossover_down = ((macd < 0) & (macd.shift(1) >= 0)).apply(lambda x: -1 if x else 0)
-        macd_signal_crossover = macd_signal_crossover_up | macd_signal_crossover_down
-        macd_zero_crossover = macd_zero_crossover_up | macd_zero_crossover_down
-        return macd_signal_crossover, macd_zero_crossover
+        signal = pd.Series(0, index=macd.index, dtype="int8")
+        signal = signal.mask(buy, 1)
+        signal = signal.mask(sell, -1)
+        return signal
 
     @staticmethod
-    def get
+    def get_rsi_signal(rsi, rsi_6):
+        oversold = 30
+        overbought = 70
+
+        prev_fast, prev_slow = rsi_6.shift(1), rsi.shift(1)        
+        rsi_crossover_up = ((rsi < rsi_6) & (prev_fast > prev_slow))
+        rsi_crossover_down = ((rsi > rsi_6) & (prev_fast < prev_slow))
+        
+        bull_zone = (rsi_6 > 50) & (rsi > 50)
+        bear_zone = (rsi_6 < 50) & (rsi < 50)
+
+        buy = rsi_crossover_up & bull_zone
+        sell = rsi_crossover_down & bear_zone
+
+        oversold_exit = (rsi_6 > oversold) & (prev_fast <= oversold)
+        overbought_exit = (rsi_6 < overbought) & (prev_fast >= overbought)
+        long = buy | oversold_exit
+        short = sell | overbought_exit
+        signal = pd.Series(0, index=rsi.index, dtype="int8")
+        signal = signal.mask(long & ~short, 1)
+        signal = signal.mask(short & ~long, -1)
+        return signal
+
+    @staticmethod
+    def get_adx_signal(adx, pdi=None, ndi=None, slope_win=3):
+        if isinstance(adx, pd.DataFrame):
+            df = adx
+            if "tic" in df.columns:
+                return pd.concat(
+                    Utils.get_adx_signal(g["adx"], g["pdi"], g["ndi"], slope_win)
+                    for _, g in df.groupby("tic", sort=False)
+                )
+            adx, pdi, ndi = df["adx"], df["pdi"], df["ndi"]
+        slope_up = adx.diff(slope_win) > 0      # 3-day slope: fewer 1-day flips
+
+        buy  = (pdi > ndi) & slope_up           # uptrend strengthening
+        sell = (ndi > pdi) & slope_up           # downtrend strengthening
+
+        signal = pd.Series(0, index=adx.index, dtype="int8")
+        signal = signal.mask(buy, 1)
+        signal = signal.mask(sell, -1)
+        return signal
+
+    @staticmethod
+    def get_cci_signal(cci, pdi, ndi):
+        """When CCI > 100: buy if +DI > −DI, else sell."""
+        extreme = cci > 100
+        signal = pd.Series(0, index=cci.index, dtype="int8")
+        signal = signal.mask(extreme & (pdi > ndi), 1)
+        signal = signal.mask(extreme & (pdi < ndi), -1)
+        return signal
+
+    @staticmethod
+    def eval_signal(features, col, cost=0.001):
+        """Equal-weight daily PnL of a ±1/0 signal column.
+
+        Signal on day t is held on day t+1. Cost is charged on |Δheld|.
+        """
+        f = features.sort_values(["tic", "date"]).copy()
+        g = f.groupby("tic", sort=False)
+        f["r"] = g["close"].pct_change()
+        f["held"] = g[col].shift(1).fillna(0)
+        f["trade"] = f.groupby("tic", sort=False)["held"].diff().abs().fillna(f["held"].abs())
+        f["pnl"] = f["held"] * f["r"] - cost * f["trade"]
+
+        daily = f.groupby("date")["pnl"].mean()
+        active = f["held"] != 0
+        return {
+            "sharpe": daily.mean() / daily.std() * np.sqrt(252),
+            "ann_return": daily.mean() * 252,
+            "turnover/yr": f.groupby("date")["trade"].mean().mean() * 252,
+            "hit_rate": (np.sign(f.loc[active, "held"]) == np.sign(f.loc[active, "r"])).mean(),
+            "time_in_mkt": active.mean(),
+        }
+
+    @staticmethod
+    def hold_until_opposite(signal):
+        """1 1 1 ... until a sell, then -1 -1 -1 ... until a buy."""
+        return signal.replace(0, np.nan).ffill().fillna(0).astype("int8")
 if __name__ == "__main__":
     df = Utils.create_df("./data/anonymized_data/")
     n = 1
     df = Utils.get_first_n_assets(df, n)
     features = Utils.get_features(df)
     # df = Utils.get_feat(df, n).dropna() 
-    a, b = Utils.get_macd_signal(features['macd'], features['macds'], features['macds'])
+    a = Utils.get_macd_signal(features['macd'], features['macds'], features['macdh'])
