@@ -256,11 +256,11 @@ class PortfolioOptimizationEnv(gym.Env):
                     self._portfolio_value / self._asset_memory["final"][0]
                 )
             )
-            print(
-                "Maximum DrawDown: {}".format(
-                    qs.stats.max_drawdown(metrics_df["portfolio_values"])
-                )
-            )
+
+            equity = metrics_df["portfolio_values"]
+            max_dd = (equity / equity.cummax() - 1).min()
+            print("Maximum DrawDown: {}".format(max_dd))
+
             print("Sharpe ratio: {}".format(qs.stats.sharpe(metrics_df["returns"])))
             print("=================================")
 
@@ -268,6 +268,7 @@ class PortfolioOptimizationEnv(gym.Env):
                 metrics_df["returns"],
                 show=False,
                 savefig= str(self._results_file / "portfolio_summary.png"),
+                fontname='DejaVu Sans'
             )
             return self._state, self._reward, self._terminal, False, self._info
 
@@ -343,7 +344,8 @@ class PortfolioOptimizationEnv(gym.Env):
                 self._asset_memory["final"][-1] / self._asset_memory["final"][-2]
             )
             portfolio_return = rate_of_return - 1
-            portfolio_reward = np.log(rate_of_return)
+            ew_rate = float(self._price_variation[1:].mean())
+            portfolio_reward = np.log(rate_of_return) - np.log(ew_rate) 
 
             # save portfolio return memory
             self._portfolio_return_memory.append(portfolio_return)

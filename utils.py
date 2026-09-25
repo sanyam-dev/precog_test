@@ -284,6 +284,23 @@ class Utils:
         return signal
 
     @staticmethod
+    def add_signals(features: pd.DataFrame) -> pd.DataFrame:
+        """Write macd/rsi/adx/cci signal columns onto features, one ticker at a time."""
+        groups = features.groupby("tic", sort=False) if "tic" in features.columns else [(None, features)]
+        parts = []
+        for _, group in groups:
+            g = group.sort_values("date").copy() if "date" in group.columns else group.copy()
+            g["macd_signal"] = Utils.get_macd_signal(g["macd"], g["macds"], g["macdh"]).to_numpy()
+            g["rsi_signal"] = Utils.get_rsi_signal(g["rsi"], g["rsi_6"]).to_numpy()
+            g["adx_signal"] = Utils.get_adx_signal(g["adx"], g["pdi"], g["ndi"]).to_numpy()
+            g["cci_signal"] = Utils.get_cci_signal(g["cci"], g["pdi"], g["ndi"]).to_numpy()
+            parts.append(g)
+        out = pd.concat(parts)
+        if {"date", "tic"}.issubset(out.columns):
+            out = out.sort_values(["date", "tic"])
+        return out
+
+    @staticmethod
     def eval_signal(features, col, cost=0.001):
         """Equal-weight daily PnL of a ±1/0 signal column.
 
@@ -310,6 +327,72 @@ class Utils:
     def hold_until_opposite(signal):
         """1 1 1 ... until a sell, then -1 -1 -1 ... until a buy."""
         return signal.replace(0, np.nan).ffill().fillna(0).astype("int8")
+    
+    @staticmethod
+    def get_ic(features, horizons=(1, 5, 10), block=63):
+        """Time-series Spearman IC and ICIR vs next-h-day log return.
+
+        Signal on day t is paired with log(close[t+h] / close[t]),
+        which is the sum of `log-ret` from t+1 to t+h.
+        Each ticker is shifted on its own dates.
+        ICIR is mean / std of non-overlapping `block`-day Spearman ICs.
+        """
+        skip = {"date", "tic"}
+        cols = [
+            c for c in features.columns
+            if c not in skip and pd.api.types.is_numeric_dtype(features[c])
+        ]
+
+        groups = (
+            features.groupby("tic", sort=False)
+            if "tic" in features.columns
+            else [(None, features)]
+        )
+        
+        rows = []
+        for col in cols:
+            for h in horizons:
+                ics, hits, blocks, n = [], [], [], 0
+                for _, g in groups:
+                    g = g.sort_values("date") if "date" in g.columns else g
+                    fwd = g["log-ret"].shift(-h).rolling(h).sum()
+                    pair = pd.concat([g[col], fwd], axis=1).dropna()
+                    if pair.empty:
+                        continue
+                    s, r = pair.iloc[:, 0], pair.iloc[:, 1]
+                    ics.append(s.corr(r, method="spearman"))
+                    hits.append((np.sign(s) == np.sign(r)).mean())
+                    n += len(pair)
+                    for i in range(0, len(pair) - block + 1, block):
+                        sb, rb = s.iloc[i:i + block], r.iloc[i:i + block]
+                        if sb.nunique() < 2 or rb.nunique() < 2:
+                            continue
+                        ic_b = sb.corr(rb, method="spearman")
+                        if pd.notna(ic_b):
+                            blocks.append(ic_b)
+                ic = np.nanmean(ics) if ics else np.nan
+                tstat = (
+                    ic * np.sqrt(max(n - 2, 0)) / np.sqrt(max(1 - ic ** 2, 1e-12)) / np.sqrt(h)
+                    if n > 2 and pd.notna(ic)
+                    else np.nan
+                )
+                icir = (
+                    np.mean(blocks) / np.std(blocks, ddof=1)
+                    if len(blocks) > 1 and np.std(blocks, ddof=1) > 0
+                    else np.nan
+                )
+                rows.append({
+                    "signal": col,
+                    "h": h,
+                    "IC": ic,
+                    "t": tstat,
+                    "ICIR": icir,
+                    "hit": np.nanmean(hits) if hits else np.nan,
+                    "n": n,
+                    "blocks": len(blocks),
+                })
+        return pd.DataFrame(rows).round(4)
+
 if __name__ == "__main__":
     df = Utils.create_df("./data/anonymized_data/")
     n = 1
