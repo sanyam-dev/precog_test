@@ -1,0 +1,15 @@
+gym==0.26.2
+lightgbm==4.7.0
+matplotlib==3.10.9
+numpy==2.2.6
+optuna==5.0.0
+pandas==3.0.5
+pandas-ta==0.4.71b0
+quantstats==0.0.81
+scikit-learn==1.9.1
+scipy==1.18.1
+seaborn==0.13.2
+stable-baselines3==2.9.0
+statsmodels==0.15.0
+stockstats==0.6.8
+xgboost==3.4.1
