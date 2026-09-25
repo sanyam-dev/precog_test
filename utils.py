@@ -8,8 +8,9 @@ class Utils:
 
     FEATURE_LIST = [
         "log-ret", # daily log retur
-        "return", # daily return  
-        "volatility", # RiskMetric EWMA volatility
+        "return", # daily return
+        "boll_ub", # Bollinger upper band (20 SMA + 2 std)
+        "boll_lb", # Bollinger lower band (20 SMA - 2 std)
         "rsi_6",  # 6 day RSI
         "rsi",
         "cci_6",
@@ -29,6 +30,8 @@ class Utils:
         "tema",
         "pvo"
         ]
+
+    SIGNAL_COLS = ["macd_signal", "rsi_signal", "adx_signal", "cci_signal", "boll_signal"]
 
 
     @staticmethod
@@ -86,9 +89,8 @@ class Utils:
 
     @staticmethod
     def get_first_n_assets(df:pd.DataFrame, n: int):
-        assets = df['tic'].unique()
-        assets = assets[:n]
-        return wrap(df.apply(lambda x: x if x['tic'] in assets else None, axis=1).dropna())
+        assets = df['tic'].unique()[:n]
+        return wrap(df[df['tic'].isin(assets)])
 
     @staticmethod
     def rule_signals(df: pd.DataFrame) -> pd.DataFrame:
@@ -177,7 +179,7 @@ class Utils:
                 "cci_adx": Utils._side(cci_up & confirmed, cci_down & confirmed),
                 "stochrsi_trend": Utils._side(stoch_up & confirmed, stoch_down & confirmed),
             },
-            index=px.index,
+            index=px.index, 
         )
         return signals
 
@@ -185,7 +187,7 @@ class Utils:
 
     @staticmethod
     def get_features(df: pd.DataFrame):
-        derived = ['volatility', 'residual_return', 'return']
+        derived = ['residual_return', 'return']
         df = df.reset_index()
         parts = []
         stock_cols = [col for col in Utils.FEATURE_LIST if col not in derived]
@@ -193,7 +195,6 @@ class Utils:
         for tic, group in features.groupby("tic", sort=False):
             a = wrap(group.sort_values(by='date'))
             _ = a[stock_cols]
-            a['volatility'] = Utils.get_volatility(a)
             # a['residual_return'] = Utils.get_residual_return(a)
             part=pd.DataFrame(a).reset_index()
             part['tic'] = tic
@@ -205,16 +206,17 @@ class Utils:
         return out
 
     @staticmethod
-    def get_volatility(df, lam=0.94):
-        """
-        RiskMetrics EWMA volatility from close, one series per tic.
-        sigma^2_t = lam * sigma^2_{t-1} + (1 - lam) * r_{t-1}^2
-        Default lam=0.94 (daily RiskMetrics).
-        """
-        def _one(close):
-            r2 = close.pct_change().pow(2).shift(1)
-            return r2.ewm(alpha=1.0 - lam, adjust=False).mean().pow(0.5)
-        return df.groupby("tic", sort=False)["close"].transform(_one)
+    def rolling_standardize(x, window=10):
+        """Z-score against the trailing `window`-day mean and std (no look-ahead)."""
+        roll = x.rolling(window)
+        return (x - roll.mean()) / roll.std()
+
+    @staticmethod
+    def rolling_minmax(x, window=10):
+        """Scale to [0, 1] with the trailing `window`-day min and max (no look-ahead)."""
+        roll = x.rolling(window)
+        lo, hi = roll.min(), roll.max()
+        return (x - lo) / (hi - lo).replace(0, np.nan)
 
 
     @staticmethod
@@ -276,16 +278,31 @@ class Utils:
 
     @staticmethod
     def get_cci_signal(cci, pdi, ndi):
-        """When CCI > 100: buy if +DI > −DI, else sell."""
-        extreme = cci > 100
+        """Buy when CCI > 100 and +DI > −DI. Sell when CCI < −100 and −DI > +DI."""
         signal = pd.Series(0, index=cci.index, dtype="int8")
-        signal = signal.mask(extreme & (pdi > ndi), 1)
-        signal = signal.mask(extreme & (pdi < ndi), -1)
+        signal = signal.mask((cci > 100) & (pdi > ndi), 1)
+        signal = signal.mask((cci < -100) & (ndi > pdi), -1)
+        return signal
+
+    @staticmethod
+    def get_boll_signal(close, boll_ub, boll_lb):
+        """Investopedia reading of Bollinger Bands.
+
+        Close touches or falls below the lower band -> oversold -> buy (+1).
+        Close touches or rises above the upper band -> overbought -> sell (-1).
+        """
+        signal = pd.Series(0, index=close.index, dtype="int8")
+        signal = signal.mask(close <= boll_lb, 1)
+        signal = signal.mask(close >= boll_ub, -1)
         return signal
 
     @staticmethod
     def add_signals(features: pd.DataFrame) -> pd.DataFrame:
-        """Write macd/rsi/adx/cci signal columns onto features, one ticker at a time."""
+        """Write macd/rsi/adx/cci/boll signal columns onto features, one ticker at a time.
+
+        Each `<name>_signal_held` column holds +1 from a buy until the next sell,
+        and -1 from a sell until the next buy (0 before the first signal).
+        """
         groups = features.groupby("tic", sort=False) if "tic" in features.columns else [(None, features)]
         parts = []
         for _, group in groups:
@@ -294,11 +311,14 @@ class Utils:
             g["rsi_signal"] = Utils.get_rsi_signal(g["rsi"], g["rsi_6"]).to_numpy()
             g["adx_signal"] = Utils.get_adx_signal(g["adx"], g["pdi"], g["ndi"]).to_numpy()
             g["cci_signal"] = Utils.get_cci_signal(g["cci"], g["pdi"], g["ndi"]).to_numpy()
+            g["boll_signal"] = Utils.get_boll_signal(g["close"], g["boll_ub"], g["boll_lb"]).to_numpy()
+            for col in Utils.SIGNAL_COLS:
+                g[col + "_held"] = Utils.hold_until_opposite(g[col]).to_numpy()
             parts.append(g)
         out = pd.concat(parts)
         if {"date", "tic"}.issubset(out.columns):
             out = out.sort_values(["date", "tic"])
-        return out
+        return out.reset_index(drop=True)
 
     @staticmethod
     def eval_signal(features, col, cost=0.001):
