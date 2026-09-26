@@ -3,6 +3,18 @@ import os
 from stockstats import wrap
 from stockstats import StockDataFrame as sdf
 import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+from sklearn.decomposition import PCA
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+# Chart colors: one fixed color per series, blue <-> gray <-> red for signed values.
+SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+MUTED = "#52514e"
+DIVERGING = LinearSegmentedColormap.from_list("blue_gray_red", ["#104281", "#f0efec", "#b3261e"])
 
 class Utils:
 
@@ -218,6 +230,158 @@ class Utils:
         lo, hi = roll.min(), roll.max()
         return (x - lo) / (hi - lo).replace(0, np.nan)
 
+    # A trading year is ~252 sessions, so three months is 63 sessions.
+    CORR_WINDOW = 63
+    # Price levels repeat the same path (close, bands, moving averages). They are
+    # not part of the feature matrix unless the caller passes them in `columns`.
+    _PRICE_LEVELS = {
+        "open", "high", "low", "close", "volume",
+        "boll", "boll_ub", "boll_lb",
+        "close_5_sma", "close_20_ema", "close_5_ema", "tema",
+    }
+
+    @staticmethod
+    def _feature_columns(features, columns):
+        if columns is not None:
+            return list(columns)
+        numeric = [
+            c for c in features.columns
+            if c not in {"date", "tic"} and pd.api.types.is_numeric_dtype(features[c])
+        ]
+        chosen = [c for c in numeric if c not in Utils._PRICE_LEVELS]
+        return chosen or numeric
+
+    @staticmethod
+    def _feature_cube(features, columns):
+        """Date x asset x feature array, dates and assets sorted.
+
+        Each feature is placed on the same dates and assets. A feature with no
+        value on a date stays missing there, instead of dropping that date and
+        changing the matrix shape.
+        """
+        work = features[["date", "tic", *columns]].replace([np.inf, -np.inf], np.nan).copy()
+        work["date"] = pd.to_datetime(work["date"])
+        dates = pd.Index(pd.unique(work["date"])).sort_values()
+        assets = pd.Index(sorted(pd.unique(work["tic"])))
+        wide = []
+        for column in columns:
+            panel = (
+                work.pivot_table(index="date", columns="tic", values=column, aggfunc="last")
+                .reindex(index=dates, columns=assets)
+            )
+            wide.append(panel.to_numpy(dtype=float))
+        cube = np.stack(wide, axis=-1)  # dates x assets x features
+        return dates, list(assets), cube
+
+    @staticmethod
+    def _feature_corr_vectors(block):
+        """Per-feature asset correlation for one window.
+
+        `block` is (sessions, assets, features). Returns (vectors, scores)
+        with vectors shaped (assets, assets, features). A feature that is
+        constant or missing for an asset is left out of that asset's vector.
+        The score is the Euclidean magnitude of the finite part of the vector.
+        """
+        sessions, n_assets, n_features = block.shape
+        vectors = np.full((n_assets, n_assets, n_features), np.nan)
+        for f in range(n_features):
+            column = block[:, :, f]
+            if np.isnan(column).any():
+                continue
+            centered = column - column.mean(axis=0)
+            std = np.sqrt((centered ** 2).sum(axis=0) / (sessions - 1))
+            valid = std > 0
+            if valid.sum() < 2:
+                continue
+            standardized = np.zeros_like(centered)
+            standardized[:, valid] = centered[:, valid] / std[valid]
+            corr = (standardized.T @ standardized) / (sessions - 1)
+            corr[~valid, :] = np.nan
+            corr[:, ~valid] = np.nan
+            np.fill_diagonal(corr, np.where(valid, 1.0, np.nan))
+            vectors[:, :, f] = corr
+        scores = np.sqrt(np.nansum(vectors ** 2, axis=2))
+        return vectors, scores
+
+    @staticmethod
+    def feature_pair_correlation(features, columns=None, window=None):
+        """Correlation of asset pairs from each asset's trailing feature matrix.
+
+        For a window of `window` sessions (default 63, about three months),
+        each asset is a matrix of shape (sessions, features). For every pair,
+        the correlation vector has one Pearson correlation per feature, using
+        only dates inside that window. The pair score is the magnitude of
+        that vector. A feature with a missing value in the window is left out of the vector.
+
+        Returns (scores, vectors, history). `scores` is the latest asset x
+        asset matrix of magnitudes. `vectors` is the latest correlation
+        vector for each unordered pair, one column per feature. `history`
+        is the mean off-diagonal score each time the window is full.
+        """
+        window = Utils.CORR_WINDOW if window is None else window
+        columns = Utils._feature_columns(features, columns)
+        dates, assets, cube = Utils._feature_cube(features, columns)
+        n_assets = len(assets)
+        upper = np.triu_indices(n_assets, k=1)
+        means, mean_dates, latest_vectors, latest_scores = [], [], None, None
+        for end in range(window, len(dates) + 1):
+            vectors, scores = Utils._feature_corr_vectors(cube[end - window:end])
+            if np.all(np.isnan(vectors)):
+                continue
+            means.append(float(scores[upper].mean()))
+            mean_dates.append(dates[end - 1])
+            latest_vectors, latest_scores = vectors, scores
+        if latest_scores is None:
+            raise ValueError(f"No complete {window}-session feature window")
+
+        scores = pd.DataFrame(latest_scores, index=assets, columns=assets)
+        end = pd.Timestamp(mean_dates[-1])
+        start = pd.Timestamp(dates[dates.get_loc(mean_dates[-1]) - window + 1])
+        scores.attrs.update(end=end, start=start, window=window, features=list(columns))
+
+        left, right = upper
+        vectors = pd.DataFrame(
+            latest_vectors[left, right, :],
+            index=pd.MultiIndex.from_arrays([np.array(assets)[left], np.array(assets)[right]], names=["asset_a", "asset_b"]),
+            columns=list(columns),
+        )
+        history = pd.Series(means, index=pd.Index(mean_dates, name="date"), name="mean_score")
+        return scores, vectors, history
+
+    @staticmethod
+    def asset_corr_pairs(corr, column="score"):
+        """Unique asset pairs from a score matrix, highest score first."""
+        labels = corr.columns.to_numpy()
+        left, right = np.triu_indices(len(labels), k=1)
+        pairs = pd.DataFrame({
+            "asset_a": labels[left],
+            "asset_b": labels[right],
+            column: corr.to_numpy()[left, right],
+        })
+        return pairs.sort_values(column, ascending=False).reset_index(drop=True)
+
+    @staticmethod
+    def plot_asset_corr(corr):
+        """Heatmap of pair scores. The diagonal is an asset with itself and is left blank."""
+        shown = corr.to_numpy(dtype=float).copy()
+        np.fill_diagonal(shown, np.nan)
+        end = pd.Timestamp(corr.attrs.get("end"))
+        start = pd.Timestamp(corr.attrs.get("start"))
+        window = corr.attrs.get("window", Utils.CORR_WINDOW)
+        n_features = len(corr.attrs.get("features", []))
+        fig, ax = plt.subplots(figsize=(8, 6.5))
+        image = ax.imshow(shown, cmap="Blues", vmin=0, vmax=np.nanmax(shown), aspect="equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(
+            f"Pair score from {n_features} features\n"
+            f"trailing {window} sessions, {start:%Y-%m-%d} to {end:%Y-%m-%d}"
+        )
+        fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04, label="Magnitude of correlation vector")
+        fig.tight_layout()
+        plt.show()
+        return ax
+
 
     @staticmethod
     def get_macd_signal(macd, macds, macdh):
@@ -412,6 +576,175 @@ class Utils:
                     "blocks": len(blocks),
                 })
         return pd.DataFrame(rows).round(4)
+
+    # ------------------------------------------------------------------ PCA
+
+    @staticmethod
+    def fit_pca(X, n_components=None):
+        """Standardize then PCA. Returns the fitted (scaler, pca) pipeline.
+
+        `n_components` may be an int, a variance fraction in (0, 1) such as 0.9,
+        or None to keep every component (use this for the variance analysis).
+        """
+        pipe = make_pipeline(StandardScaler(), PCA(n_components=n_components, svd_solver="full"))
+        pipe.fit(X)
+        return pipe
+
+    @staticmethod
+    def pca_variance_table(pipe, thresholds=(0.8, 0.9, 0.95)):
+        """Explained variance per component, plus components needed per threshold."""
+        ratio = pipe[-1].explained_variance_ratio_
+        table = pd.DataFrame({
+            "component": [f"PC{i}" for i in range(1, len(ratio) + 1)],
+            "explained": ratio,
+            "cumulative": np.cumsum(ratio),
+        })
+        needed = {t: int(np.searchsorted(table["cumulative"], t) + 1) for t in thresholds}
+        return table, needed
+
+    @staticmethod
+    def pca_loadings(pipe, feature_names, n_components=None):
+        """Feature x component loadings (weights on standardized features)."""
+        comps = pipe[-1].components_[:n_components]
+        cols = [f"PC{i}" for i in range(1, len(comps) + 1)]
+        return pd.DataFrame(comps.T, index=list(feature_names), columns=cols)
+
+    @staticmethod
+    def top_loadings(loadings, k=5):
+        """For each component, the `k` features with the largest |loading|, signed."""
+        rows = {}
+        for pc in loadings.columns:
+            top = loadings[pc].reindex(loadings[pc].abs().sort_values(ascending=False).index)[:k]
+            rows[pc] = [f"{name} ({w:+.2f})" for name, w in top.items()]
+        return pd.DataFrame(rows, index=[f"#{i}" for i in range(1, k + 1)]).T
+
+    @staticmethod
+    def plot_pca_variance(pipe, thresholds=(0.8, 0.9, 0.95), max_components=None):
+        """Scree plot: variance explained by each component."""
+        table, needed = Utils.pca_variance_table(pipe, thresholds)
+        table = table.iloc[:max_components]
+        x = np.arange(1, len(table) + 1)
+
+        fig, ax = plt.subplots(figsize=(10, 3.8))
+        ax.bar(x, table["explained"], color=SERIES_COLORS[0], width=0.8)
+        ax.set_title("Variance explained by each component")
+        ax.set_xlabel("Component")
+        ax.set_ylabel("Share of variance")
+        ax.set_xticks(x)
+        ax.grid(axis="y", alpha=0.3)
+        ax.spines[["top", "right"]].set_visible(False)
+        fig.tight_layout()
+        plt.show()
+        return table, needed
+
+    @staticmethod
+    def plot_cumulative_variance(pipe, target=0.9):
+        """Number of components vs cumulative variance, marking the smallest N that reaches `target`.
+
+        Kept components (1..N) are blue, dropped ones gray. Returns N.
+        """
+        table, needed = Utils.pca_variance_table(pipe, (target,))
+        n = needed[target]
+        x = np.arange(1, len(table) + 1)
+        cum = table["cumulative"].to_numpy()
+        kept = x <= n
+
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+        ax.plot(x, cum, color=MUTED, lw=1, zorder=1)
+        ax.plot(x[kept], cum[kept], color=SERIES_COLORS[0], lw=2, zorder=2)
+        ax.scatter(x[kept], cum[kept], s=48, color=SERIES_COLORS[0], edgecolor="white", linewidth=1.5, zorder=3,
+                   label=f"Kept (top {n})")
+        ax.scatter(x[~kept], cum[~kept], s=40, color="#b4b2ab", edgecolor="white", linewidth=1.5, zorder=3,
+                   label="Dropped")
+        ax.axhline(target, color=MUTED, ls="--", lw=0.8)
+        ax.axvline(n, color=MUTED, ls=":", lw=0.8)
+        ax.annotate(f"N = {n} components explain {cum[n - 1]:.1%}\n(first N to reach the {target:.0%} target)",
+                    (n, cum[n - 1]), xytext=(14, -42), textcoords="offset points", color="#0b0b0b", fontsize=10,
+                    arrowprops=dict(arrowstyle="-", color=MUTED, lw=0.8))
+        ax.text(x[-1], target, f"{target:.0%} target", color=MUTED, fontsize=9, ha="right", va="bottom")
+        ax.set_xticks(x)
+        ax.set_ylim(0, 1.02)
+        ax.set_title("How many components? Cumulative variance explained")
+        ax.set_xlabel("Number of components")
+        ax.set_ylabel("Cumulative share of variance")
+        ax.grid(axis="y", alpha=0.3)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.legend(loc="lower right", frameon=False)
+        fig.tight_layout()
+        plt.show()
+        return n
+
+    @staticmethod
+    def component_summary(pipe, feature_names, n_components, k=3):
+        """Top `n_components` PCs: variance, cumulative variance and the `k` heaviest features."""
+        table, _ = Utils.pca_variance_table(pipe)
+        top = Utils.top_loadings(Utils.pca_loadings(pipe, feature_names, n_components), k)
+        summary = table.iloc[:n_components].set_index("component")
+        summary["top_features"] = top.apply(", ".join, axis=1)
+        return summary
+
+    @staticmethod
+    def plot_pca_loadings(loadings):
+        """Heatmap of feature loadings on each component (blue negative, red positive)."""
+        lim = np.abs(loadings.to_numpy()).max()
+        fig, ax = plt.subplots(figsize=(1.0 + 0.6 * loadings.shape[1], 0.32 * loadings.shape[0] + 1.2))
+        im = ax.imshow(loadings, cmap=DIVERGING, vmin=-lim, vmax=lim, aspect="auto")
+        ax.set_xticks(range(loadings.shape[1]), loadings.columns)
+        ax.set_yticks(range(loadings.shape[0]), loadings.index)
+        ax.set_title("PCA loadings (feature weight on each component)")
+        fig.colorbar(im, ax=ax, label="Loading", shrink=0.8)
+        fig.tight_layout()
+        plt.show()
+
+    # ------------------------------------------------------------- LightGBM
+
+    @staticmethod
+    def lgb_walk_forward(data, feature_cols, target="y", n_components=None, n_splits=5, lgb_params=None):
+        """Pooled LightGBM with expanding-window CV split on dates.
+
+        Every asset shares the same train/validation cut-off. If `n_components`
+        is set, a scaler + PCA is fit on each training fold only (no look-ahead)
+        and the model sees components instead of raw features.
+        Returns (predictions, per-fold metrics).
+        """
+        import lightgbm as lgb
+
+        params = dict(n_estimators=100, learning_rate=0.05, random_state=42, verbose=-1)
+        params.update(lgb_params or {})
+        dates = np.sort(data["date"].unique())
+        preds, metrics = [], []
+        for fold, (tr_d, va_d) in enumerate(TimeSeriesSplit(n_splits=n_splits).split(dates), start=1):
+            tr = data[data["date"].isin(dates[tr_d])]
+            va = data[data["date"].isin(dates[va_d])]
+            X_tr, X_va = tr[feature_cols], va[feature_cols]
+            n_used = len(feature_cols)
+            if n_components is not None:
+                pipe = Utils.fit_pca(X_tr, n_components)
+                X_tr, X_va = pipe.transform(X_tr), pipe.transform(X_va)
+                n_used = pipe[-1].n_components
+
+            model = lgb.LGBMRegressor(**params)
+            model.fit(X_tr, tr[target])
+
+            fold_pred = va[["date", "tic", target]].copy()
+            fold_pred["pred"] = model.predict(X_va)
+            fold_pred["fold"] = fold
+            preds.append(fold_pred)
+
+            y, p = fold_pred[target], fold_pred["pred"]
+            metrics.append({
+                "fold": fold,
+                "train_rows": len(tr),
+                "val_rows": len(va),
+                "n_inputs": n_used,
+                "rmse": np.sqrt(mean_squared_error(y, p)),
+                "rmse_zero": np.sqrt(mean_squared_error(y, np.zeros(len(y)))),
+                "ic": fold_pred.groupby("date").apply(
+                    lambda g: g[target].corr(g["pred"], method="spearman")
+                ).mean(),
+                "hit": (np.sign(y) == np.sign(p)).mean(),
+            })
+        return pd.concat(preds, ignore_index=True), pd.DataFrame(metrics)
 
 if __name__ == "__main__":
     df = Utils.create_df("./data/anonymized_data/")

@@ -18,10 +18,11 @@ assets furthest below their proportional amount, until no requested share fits. 
 executed trades keep the agent's relative preferences, and no buy exceeds its request.
 
 The reward and the observation differ from FinRL. The reward is the portfolio's log
-return, minus the optional volatility and equal-weight penalties. Unlike
+return minus the risk-free log return (``rf_return`` on the session just held), and
+minus the optional volatility and equal-weight penalties. Unlike
 PortfolioOptimizationEnv in poe.py, it does not subtract the equal-weight portfolio's
-return, which the agent cannot influence. The observation holds scale-free features plus
-the current portfolio weights, never raw cash, prices or share counts.
+return, which the agent cannot influence. The observation holds the feature columns
+plus the current portfolio weights, never raw cash, prices or share counts.
 """
 
 import gymnasium as gym
@@ -39,7 +40,7 @@ class ShareTradingEnv(gym.Env):
         weights: current portfolio weights, cash first, shape (assets + 1,)
 
     Reward per step:
-        log(portfolio return)
+        log(portfolio return) - log(1 + rf_return)
         - vol_penalty * volatility of the held weights
         - ew_penalty * (1 - deviation from equal weight)
     """
@@ -113,7 +114,13 @@ class ShareTradingEnv(gym.Env):
         # (time, features, tics) and (time, tics), built once
         self._state_array = np.stack([grid(f) for f in self._features], axis=1).astype(np.float32)
         self._price_array = grid(price_column)
-        missing = int(np.isnan(self._state_array).sum()) + int(np.isnan(self._price_array).sum())
+        if "rf_return" not in frame.columns:
+            raise ValueError("ShareTradingEnv needs an rf_return column (one rate per date).")
+        rf_grid = grid("rf_return")
+        if not np.allclose(rf_grid, rf_grid[:, :1], equal_nan=True):
+            raise ValueError("rf_return must be the same for every ticker on a date.")
+        self._rf_array = rf_grid[:, 0]
+        missing = int(np.isnan(self._state_array).sum()) + int(np.isnan(self._price_array).sum()) + int(np.isnan(self._rf_array).sum())
         if missing:
             raise ValueError(
                 f"{missing} NaN values after aligning dates and tickers. "
@@ -192,6 +199,8 @@ class ShareTradingEnv(gym.Env):
 
         rate_of_return = self._portfolio_value / value_before
         price_relatives = new_prices / prices
+        # rf_return on the session just held: the rate in force over this holding day
+        rf = float(self._rf_array[self._time_index - 1])
 
         # volatility of the chosen asset weights over the trailing window (cash has none)
         w = chosen[1:]
@@ -206,6 +215,7 @@ class ShareTradingEnv(gym.Env):
 
         reward = (
             np.log(rate_of_return)
+            - np.log(1.0 + rf)
             - self._vol_penalty * port_vol
             - self._ew_penalty * (1.0 - ew_deviation)
         )
