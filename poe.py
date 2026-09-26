@@ -88,6 +88,11 @@ class PortfolioOptimizationEnv(gym.Env):
         time_window=1,
         cwd="./",
         new_gym_api=False,
+        vol_window=20,
+        vol_penalty=0.0,
+        ew_penalty=0.0,
+        action_temperature=1.0,
+        save_plots=True,
     ):
         """Initializes environment's instance.
 
@@ -120,6 +125,14 @@ class PortfolioOptimizationEnv(gym.Env):
             cwd: Local repository in which resulting graphs will be saved.
             new_gym_api: If True, the environment will use the new gym api standard for
                 step and reset methods.
+            vol_window: Trailing window, in steps, for the portfolio volatility estimate.
+            vol_penalty: Reward penalty per unit of daily portfolio volatility (0 = off).
+            ew_penalty: Reward penalty for staying close to equal weight. The penalty is
+                ew_penalty at exactly equal weight and 0 with everything in one asset.
+            action_temperature: Multiplier applied to raw actions before the softmax.
+                Higher values let the agent concentrate its weights more.
+            save_plots: If True, save end-of-episode charts and a quantstats snapshot
+                to results/rl. Set False for training runs.
         """
         # super(StockEnv, self).__init__()
         # money = 10 , scope = 1
@@ -138,6 +151,18 @@ class PortfolioOptimizationEnv(gym.Env):
         self._valuation_feature = valuation_feature
         self._cwd = Path(cwd)
         self._new_gym_api = new_gym_api
+        # volatility: trailing window for the covariance, and reward penalty weight
+        self._vol_window = vol_window
+        self._vol_penalty = vol_penalty
+        # reward penalty for staying close to equal weight (0 = off)
+        self._ew_penalty = ew_penalty
+        # softmax sharpness applied to raw actions (1 = plain softmax)
+        self._action_temperature = action_temperature
+        # save end-of-episode charts and the quantstats snapshot
+        self._save_plots = save_plots
+        # columns that need a day-over-day variation: the features plus the valuation price,
+        # so portfolio values stay correct when the price itself is not an observed feature
+        self._price_columns = list(dict.fromkeys(list(features) + [valuation_feature]))
 
         # results file
         self._results_file = self._cwd / "results" / "rl"
@@ -157,6 +182,9 @@ class PortfolioOptimizationEnv(gym.Env):
         # sort datetimes and define episode length
         self._sorted_times = sorted(set(self._df[time_column]))
         self.episode_length = len(self._sorted_times) - time_window + 1
+
+        # build the data once as arrays, so each step is a slice instead of a dataframe filter
+        self._build_arrays()
 
         # define action space
         self.action_space = spaces.Box(low=0, high=1, shape=(action_space,))
@@ -223,30 +251,13 @@ class PortfolioOptimizationEnv(gym.Env):
                     "returns": self._portfolio_return_memory,
                     "rewards": self._portfolio_reward_memory,
                     "portfolio_values": self._asset_memory["final"],
+                    "vol": self._vol_memory,
                 }
             )
             metrics_df.set_index("date", inplace=True)
 
-            plt.plot(metrics_df["portfolio_values"], "r")
-            plt.title("Portfolio Value Over Time")
-            plt.xlabel("Time")
-            plt.ylabel("Portfolio value")
-            plt.savefig(self._results_file / "portfolio_value.png")
-            plt.close()
-
-            plt.plot(self._portfolio_reward_memory, "r")
-            plt.title("Reward Over Time")
-            plt.xlabel("Time")
-            plt.ylabel("Reward")
-            plt.savefig(self._results_file / "reward.png")
-            plt.close()
-
-            plt.plot(self._actions_memory)
-            plt.title("Actions performed")
-            plt.xlabel("Time")
-            plt.ylabel("Weight")
-            plt.savefig(self._results_file / "actions.png")
-            plt.close()
+            if self._save_plots:
+                self._save_episode_charts(metrics_df)
 
             print("=================================")
             print("Initial portfolio value:{}".format(self._asset_memory["final"][0]))
@@ -262,14 +273,17 @@ class PortfolioOptimizationEnv(gym.Env):
             print("Maximum DrawDown: {}".format(max_dd))
 
             print("Sharpe ratio: {}".format(qs.stats.sharpe(metrics_df["returns"])))
+            print("Mean ex-ante daily vol: {}".format(float(np.mean(self._vol_memory[1:] or [0.0]))))
+            print("Mean deviation from equal weight: {}".format(float(np.mean(self._ew_deviation_memory[1:] or [0.0]))))
             print("=================================")
 
-            qs.plots.snapshot(
-                metrics_df["returns"],
-                show=False,
-                savefig= str(self._results_file / "portfolio_summary.png"),
-                fontname='DejaVu Sans'
-            )
+            if self._save_plots:
+                qs.plots.snapshot(
+                    metrics_df["returns"],
+                    show=False,
+                    savefig=str(self._results_file / "portfolio_summary.png"),
+                    fontname="DejaVu Sans",
+                )
             return self._state, self._reward, self._terminal, False, self._info
 
         else:
@@ -345,7 +359,39 @@ class PortfolioOptimizationEnv(gym.Env):
             )
             portfolio_return = rate_of_return - 1
             ew_rate = float(self._price_variation[1:].mean())
-            portfolio_reward = np.log(rate_of_return) - np.log(ew_rate) 
+
+            # volatility of the chosen weights over the trailing window
+            # ex-ante: sqrt(w' Σ w) with Σ from the last `vol_window` asset returns (cash has no variance)
+            self._asset_return_memory.append(self._price_variation[1:] - 1)
+            hist = np.asarray(self._asset_return_memory[-self._vol_window:], dtype=np.float64)
+            w = np.asarray(self._actions_memory[-1][1:], dtype=np.float64)
+            if len(hist) >= 2:
+                cov = np.atleast_2d(np.cov(hist, rowvar=False))
+                port_vol = float(np.sqrt(max(w @ cov @ w, 0.0)))
+                recent = self._portfolio_return_memory[1:][-(self._vol_window - 1):] + [portfolio_return]
+                realized_vol = float(np.std(recent, ddof=1)) if len(recent) >= 2 else 0.0
+            else:
+                port_vol = realized_vol = 0.0
+            vol_change = port_vol - self._vol_memory[-1]
+            self._vol_memory.append(port_vol)
+            self._realized_vol_memory.append(realized_vol)
+            self._info.update(portfolio_vol=port_vol, vol_change=vol_change, realized_vol=realized_vol)
+
+            # distance of the chosen asset weights from equal weight:
+            # 0 = exactly 1/n in every asset, 1 = everything in one asset
+            n = self._stock_dim
+            ew_deviation = (
+                float(np.abs(w - 1.0 / n).sum() / (2.0 * (1.0 - 1.0 / n))) if n > 1 else 0.0
+            )
+            self._ew_deviation_memory.append(ew_deviation)
+            self._info.update(ew_deviation=ew_deviation)
+
+            portfolio_reward = (
+                np.log(rate_of_return)
+                - np.log(ew_rate)
+                - self._vol_penalty * port_vol
+                - self._ew_penalty * (1.0 - ew_deviation)
+            )
 
             # save portfolio return memory
             self._portfolio_return_memory.append(portfolio_return)
@@ -414,7 +460,6 @@ class PortfolioOptimizationEnv(gym.Env):
                 "start_time_index": Index of start time of current time window,
                 "end_time": End time of current time window,
                 "end_time_index": Index of end time of current time window,
-                "data": Data related to the current time window,
                 "price_variation": Price variation of current time step
                 }
         """
@@ -422,43 +467,75 @@ class PortfolioOptimizationEnv(gym.Env):
         end_time = self._sorted_times[time_index]
         start_time = self._sorted_times[time_index - (self._time_window - 1)]
 
-        # define data to be used in this time step
-        self._data = self._df[
-            (self._df[self._time_column] >= start_time)
-            & (self._df[self._time_column] <= end_time)
-        ][[self._time_column, self._tic_column] + self._features]
+        # price variation of this time step (index 0 is cash)
+        self._price_variation = np.insert(self._price_array[time_index], 0, 1)
 
-        # define price variation of this time_step
-        price_rows = self._df_price_variation
-        matched = cast(
-            pd.DataFrame,
-            price_rows[price_rows[self._time_column] == end_time],
-        )
-        selected = cast(pd.Series, matched[self._valuation_feature])
-        self._price_variation = selected.to_numpy()
-        self._price_variation = np.insert(self._price_variation, 0, 1)
-
-        # define state to be returned
-        state = None
-        for tic in self._tic_list:
-            tic_rows = cast(
-                pd.DataFrame, self._data[self._data[self._tic_column] == tic]
-            )
-            tic_values = cast(pd.DataFrame, tic_rows[self._features]).to_numpy().T
-            tic_values = tic_values[..., np.newaxis]
-            state = tic_values if state is None else np.append(state, tic_values, axis=2)
-        assert state is not None
-        state = state.transpose((0, 2, 1))
+        # state (features, tics, time_window) sliced from the precomputed array
+        start_index = time_index - (self._time_window - 1)
+        state = self._state_array[start_index : time_index + 1].transpose((1, 2, 0))
         info = {
             "tics": self._tic_list,
             "start_time": start_time,
             "start_time_index": time_index - (self._time_window - 1),
             "end_time": end_time,
             "end_time_index": time_index,
-            "data": self._data,
             "price_variation": self._price_variation,
         }
         return self._standardize_state(state), info
+
+    def _build_arrays(self):
+        """Precompute the state and price-variation arrays once.
+
+        _state_array has shape (time, features, tics) and _price_array has shape
+        (time, tics), both in the order of _sorted_times and _tic_list.
+        """
+        times = pd.Index(self._sorted_times)
+        tics = pd.Index(self._tic_list)
+        per_feature = [
+            self._df.pivot(index=self._time_column, columns=self._tic_column, values=f)
+            .reindex(index=times, columns=tics)
+            .to_numpy(dtype=np.float32)
+            for f in self._features
+        ]
+        self._state_array = np.stack(per_feature, axis=1)
+        self._price_array = (
+            self._df_price_variation.pivot(
+                index=self._time_column, columns=self._tic_column, values=self._valuation_feature
+            )
+            .reindex(index=times, columns=tics)
+            .to_numpy(dtype=np.float32)
+        )
+        missing_state = int(np.isnan(self._state_array).sum())
+        missing_price = int(np.isnan(self._price_array).sum())
+        if missing_state or missing_price:
+            raise ValueError(
+                f"{missing_state} NaN feature values and {missing_price} NaN prices after aligning "
+                "dates and tickers. Every tic needs a row on every date, with no NaN features."
+            )
+
+    def _save_episode_charts(self, metrics_df):
+        """Save the end-of-episode charts, each on its own figure.
+
+        Explicit figures keep these charts off any figure the caller has open,
+        such as a notebook plot that is being built around a rollout.
+        """
+        fig, ax = plt.subplots()
+        ax.plot(metrics_df["portfolio_values"], "r")
+        ax.set(title="Portfolio Value Over Time", xlabel="Time", ylabel="Portfolio value")
+        fig.savefig(self._results_file / "portfolio_value.png")
+        plt.close(fig)
+
+        fig, ax = plt.subplots()
+        ax.plot(self._portfolio_reward_memory, "r")
+        ax.set(title="Reward Over Time", xlabel="Time", ylabel="Reward")
+        fig.savefig(self._results_file / "reward.png")
+        plt.close(fig)
+
+        fig, ax = plt.subplots()
+        ax.plot(self._actions_memory)
+        ax.set(title="Actions performed", xlabel="Time", ylabel="Weight")
+        fig.savefig(self._results_file / "actions.png")
+        plt.close(fig)
 
     def render(self, mode="human"):
         """Renders the environment.
@@ -469,15 +546,16 @@ class PortfolioOptimizationEnv(gym.Env):
         return self._state
 
     def _softmax_normalization(self, actions):
-        """Normalizes the action vector using softmax function.
+        """Normalizes the action vector using a softmax scaled by action_temperature.
 
         Returns:
             Normalized action vector (portfolio vector).
         """
-        numerator = np.exp(actions)
-        denominator = np.sum(np.exp(actions))
-        softmax_output = numerator / denominator
-        return softmax_output
+        logits = self._action_temperature * actions
+        if logits.max() > 50:  # keep exp() finite for large inputs
+            logits = logits - logits.max()
+        numerator = np.exp(logits)
+        return numerator / np.sum(numerator)
 
     def enumerate_portfolio(self):
         """Enumerates the current porfolio by showing the ticker symbols
@@ -502,7 +580,7 @@ class PortfolioOptimizationEnv(gym.Env):
         if order:
             self._df = self._df.sort_values(by=[self._tic_column, self._time_column])
         # defining price variation after ordering dataframe
-        self._df_price_variation = self._temporal_variation_df()
+        self._df_price_variation = self._temporal_variation_df(columns=self._price_columns)
         # apply normalization
         if normalize:
             self._normalize_dataframe(normalize)
@@ -513,8 +591,8 @@ class PortfolioOptimizationEnv(gym.Env):
         )
         # transform numeric variables to float32 (compatibility with pytorch)
         self._df[self._features] = self._df[self._features].astype("float32")
-        self._df_price_variation[self._features] = self._df_price_variation[
-            self._features
+        self._df_price_variation[self._price_columns] = self._df_price_variation[
+            self._price_columns
         ].astype("float32")
 
     def _reset_memory(self):
@@ -534,6 +612,12 @@ class PortfolioOptimizationEnv(gym.Env):
         self._final_weights = [np.array([1] + [0] * self._stock_dim, dtype=np.float32)]
         # memorize datetimes
         self._date_memory = [date_time]
+        # memorize asset returns and portfolio volatility (ex-ante and realized)
+        self._asset_return_memory = []
+        self._vol_memory = [0.0]
+        self._realized_vol_memory = [0.0]
+        # memorize how far the chosen weights are from equal weight
+        self._ew_deviation_memory = [0.0]
 
     def _standardize_state(self, state):
         """Standardize the state given the observation space. If "return_last_action"
@@ -586,20 +670,22 @@ class PortfolioOptimizationEnv(gym.Env):
         else:
             print("No normalization was performed.")
 
-    def _temporal_variation_df(self, periods=1):
+    def _temporal_variation_df(self, periods=1, columns=None):
         """Calculates the temporal variation dataframe. For each feature, this
         dataframe contains the rate of the current feature's value and the last
         feature's value given a period. It's used to normalize the dataframe.
 
         Args:
             periods: Periods (in time indexes) to calculate temporal variation.
+            columns: Columns to vary. Defaults to the observed features.
 
         Returns:
             Temporal variation dataframe.
         """
+        columns = self._features if columns is None else columns
         df_temporal_variation = self._df.copy()
         prev_columns = []
-        for column in self._features:
+        for column in columns:
             prev_column = "prev_{}".format(column)
             prev_columns.append(prev_column)
             df_temporal_variation[prev_column] = df_temporal_variation.groupby(
